@@ -124,3 +124,76 @@ func MD5All(root string) (map[string][md5.Size]byte, error) {
 	return m, nil
 }
 ```
+
+## Another improvement: handle with limit resource
+
+1. seperate sumFiles into walkFiles and digester
+```golang
+func walkFiles(done <-chan struct{}, root string) (<-chan string, <-chan error) {
+	paths := make(chan string)
+	// use buffer for non-blocking
+	errc := make(chan error, 1)
+	go func() {
+		defer close(paths)
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			select {
+			case paths <- path:
+			case <-done:
+				return errors.New("walk cancelled")
+			}
+			return nil
+		})
+		errc <- err
+	}()
+	return paths, errc
+}
+func digester(done <-chan struct{}, paths <-chan string, c chan<- result) {
+	for path := range paths {
+		data, err := os.ReadFile(path)
+		select {
+		case c <- result{path: path, sum: md5.Sum(data), err: err}:
+		case <-done:
+			return
+		}
+	}
+}
+```
+2. limit concurrent number by MD5All function
+```golang
+func MD5All(root string) (map[string][md5.Size]byte, error) {
+	done := make(chan struct{})
+	defer close(done)
+	paths, errc := walkFiles(done, root)
+	results := make(chan result)
+	var wg sync.WaitGroup
+	const numDigester = 20
+	wg.Add(numDigester)
+	for i := 0; i < numDigester; i++ {
+		go func() {
+			defer wg.Done()
+			digester(done, paths, results)
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	m := make(map[string][md5.Size]byte, 0)
+	for r := range results {
+		if r.err != nil {
+			return nil, r.err
+		}
+		m[r.path] = r.sum
+	}
+	if err := <-errc; err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+```
